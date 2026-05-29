@@ -1,0 +1,12 @@
+.env
+env.txt
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/*.db
+data/*.db-*
+data/*.db.bak_*
+.DS_Store
