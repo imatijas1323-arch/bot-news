@@ -6,7 +6,7 @@ import signal
 
 from aiogram import Bot, Dispatcher
 
-from .ai_client import create_ai_client
+from .ai_client import create_ai_client, gemini_quota_date
 from .bot import build_router, main_keyboard
 from .config import get_settings
 from .scheduler import build_scheduler
@@ -30,13 +30,31 @@ async def main() -> None:
     storage = SQLiteStorage(settings.database_path, timezone_name=settings.timezone_name)
     storage.init_db()
 
-    ai_client = create_ai_client(settings)
+    bot = Bot(token=settings.bot_token)
+
+    sent_quota_alerts: set[tuple[object, str]] = set()
+
+    async def notify_admin(text: str) -> None:
+        if not settings.admin_chat_id:
+            return
+        key = (gemini_quota_date(), text)
+        if key in sent_quota_alerts:
+            return
+        sent_quota_alerts.add(key)
+        # keep set small — drop entries from older PT days
+        for stale in [k for k in sent_quota_alerts if k[0] != gemini_quota_date()]:
+            sent_quota_alerts.discard(stale)
+        try:
+            await bot.send_message(chat_id=settings.admin_chat_id, text=text)
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to send quota alert")
+
+    ai_client = create_ai_client(settings, notify=notify_admin)
     writer_client = (
-        create_ai_client(settings, model=settings.ai_writer_model)
+        create_ai_client(settings, model=settings.ai_writer_model, notify=notify_admin)
         if settings.ai_writer_model
         else ai_client
     )
-    bot = Bot(token=settings.bot_token)
     dispatcher = Dispatcher()
     dispatcher.include_router(
         build_router(

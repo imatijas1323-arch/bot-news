@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from datetime import datetime, date, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -18,8 +21,32 @@ from .writer import (
 )
 
 
+NotifyFn = Callable[[str], Awaitable[None]]
+
+
 class AIClientError(RuntimeError):
     pass
+
+
+def gemini_quota_reset_msk() -> str:
+    """Return next Gemini quota reset time in MSK as 'HH:MM' string.
+
+    Gemini free-tier RPD resets at 00:00 Pacific Time.
+    """
+    pt = ZoneInfo("America/Los_Angeles")
+    msk = ZoneInfo("Europe/Moscow")
+    now_pt = datetime.now(pt)
+    next_reset_pt = datetime.combine(
+        (now_pt + timedelta(days=1)).date(),
+        time.min,
+        tzinfo=pt,
+    )
+    return next_reset_pt.astimezone(msk).strftime("%H:%M")
+
+
+def gemini_quota_date() -> date:
+    """Return current date in PT — used to reset exhausted-key state at PT midnight."""
+    return datetime.now(ZoneInfo("America/Los_Angeles")).date()
 
 
 def normalize_api_keys(value: str | list[str]) -> list[str]:
@@ -103,16 +130,49 @@ class GeminiAIClient(BaseAIClient):
         model: str,
         timeout_seconds: float,
         request_delay_seconds: float = 0.0,
+        notify: NotifyFn | None = None,
+        label: str = "",
     ) -> None:
         super().__init__(prompt_store)
         self.api_keys = normalize_api_keys(api_key)
         self.model = model
         self.request_delay_seconds = request_delay_seconds
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
+        self.notify = notify
+        self.label = label or model
+        self.exhausted_keys: set[int] = set()
+        self.quota_day: date | None = None
+
+    def _reset_quota_state_if_new_day(self) -> None:
+        today = gemini_quota_date()
+        if self.quota_day != today:
+            self.quota_day = today
+            self.exhausted_keys.clear()
+
+    async def _notify_key_exhausted(self, key_index: int) -> None:
+        if self.notify is None:
+            return
+        total = len(self.api_keys)
+        if key_index < total:
+            msg = (
+                f"Gemini ({self.label}): ключ #{key_index} выгорел на сегодня, "
+                f"переключаюсь на #{key_index + 1}."
+            )
+        else:
+            msg = (
+                f"Gemini ({self.label}): все {total} ключа выгорели. "
+                f"Квота обновится в {gemini_quota_reset_msk()} MSK."
+            )
+        try:
+            await self.notify(msg)
+        except Exception:
+            pass
 
     async def _complete(self, system_prompt: str, user_prompt: str, *, temperature: float) -> str:
         if not self.api_keys:
             raise AIClientError("Gemini API key is empty")
+
+        self._reset_quota_state_if_new_day()
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -129,6 +189,8 @@ class GeminiAIClient(BaseAIClient):
 
         last_status_code: int | None = None
         for key_index, api_key in enumerate(self.api_keys, start=1):
+            if key_index in self.exhausted_keys:
+                continue
             try:
                 response = await post_json_with_retries(
                     self.client,
@@ -140,8 +202,12 @@ class GeminiAIClient(BaseAIClient):
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
                 last_status_code = status_code
-                if status_code == 429 and key_index < len(self.api_keys):
-                    continue
+                if status_code == 429:
+                    if key_index not in self.exhausted_keys:
+                        self.exhausted_keys.add(key_index)
+                        await self._notify_key_exhausted(key_index)
+                    if key_index < len(self.api_keys):
+                        continue
                 raise AIClientError(f"Gemini request failed: HTTP {status_code}") from None
             except httpx.HTTPError as exc:
                 raise AIClientError(f"Gemini request failed: {exc.__class__.__name__}") from None
@@ -278,16 +344,24 @@ class FallbackAIClient(BaseAIClient):
             await self.fallback.aclose()
 
 
-def create_ai_client(settings: Settings, *, model: str | None = None) -> BaseAIClient:
+def create_ai_client(
+    settings: Settings,
+    *,
+    model: str | None = None,
+    notify: NotifyFn | None = None,
+) -> BaseAIClient:
     prompt_store = PromptStore(settings.prompt_dir)
+    primary_model = model or settings.ai_model
     primary = create_single_ai_client(
         settings.ai_provider,
-        model or settings.ai_model,
+        primary_model,
         settings.effective_ai_api_keys,
         settings.ai_base_url,
         prompt_store,
         settings.http_timeout_seconds,
         settings.ai_request_delay_seconds,
+        notify=notify,
+        label=gemini_label(primary_model),
     )
     fallback = None
     fallback_keys = settings.effective_fallback_api_keys
@@ -300,12 +374,25 @@ def create_ai_client(settings: Settings, *, model: str | None = None) -> BaseAIC
             prompt_store,
             settings.http_timeout_seconds,
             settings.ai_request_delay_seconds,
+            notify=notify,
+            label=gemini_label(settings.ai_fallback_model),
         )
     return FallbackAIClient(
         primary,
         fallback,
         primary_timeout_seconds=settings.ai_primary_timeout_seconds,
     )
+
+
+def gemini_label(model: str) -> str:
+    model_lower = model.lower()
+    if "flash-lite" in model_lower:
+        return "Flash Lite"
+    if "flash" in model_lower:
+        return "Flash"
+    if "pro" in model_lower:
+        return "Pro"
+    return model
 
 
 def create_single_ai_client(
@@ -316,6 +403,9 @@ def create_single_ai_client(
     prompt_store: PromptStore,
     timeout_seconds: float,
     request_delay_seconds: float = 0.0,
+    *,
+    notify: NotifyFn | None = None,
+    label: str = "",
 ) -> BaseAIClient:
     provider_key = provider.lower()
     if provider_key == "stub":
@@ -327,6 +417,8 @@ def create_single_ai_client(
             model=model,
             timeout_seconds=timeout_seconds,
             request_delay_seconds=request_delay_seconds,
+            notify=notify,
+            label=label,
         )
     if provider_key in {"openrouter", "openai-compatible", "openai_compatible", "amvera"}:
         resolved_base_url = base_url or "https://openrouter.ai/api/v1"
