@@ -49,6 +49,23 @@ def gemini_quota_date() -> date:
     return datetime.now(ZoneInfo("America/Los_Angeles")).date()
 
 
+def is_daily_quota_error(response: httpx.Response) -> bool:
+    """Detect from Gemini 429 body whether the limit is RPD (daily) or RPM (per-minute).
+
+    Returns True for daily-quota / unknown (safe default — mark key exhausted),
+    False for per-minute only (key still valid, just rate-limited for ~60 s).
+    """
+    try:
+        body = (response.text or "").lower()
+    except Exception:
+        return True
+    if "perminute" in body or "per_minute" in body or "requests_per_minute" in body:
+        if "perday" in body or "per_day" in body or "requests_per_day" in body:
+            return True
+        return False
+    return True
+
+
 def normalize_api_keys(value: str | list[str]) -> list[str]:
     values = value if isinstance(value, list) else [value]
     result: list[str] = []
@@ -203,9 +220,10 @@ class GeminiAIClient(BaseAIClient):
                 status_code = exc.response.status_code
                 last_status_code = status_code
                 if status_code == 429:
-                    if key_index not in self.exhausted_keys:
-                        self.exhausted_keys.add(key_index)
-                        await self._notify_key_exhausted(key_index)
+                    if is_daily_quota_error(exc.response):
+                        if key_index not in self.exhausted_keys:
+                            self.exhausted_keys.add(key_index)
+                            await self._notify_key_exhausted(key_index)
                     if key_index < len(self.api_keys):
                         continue
                 raise AIClientError(f"Gemini request failed: HTTP {status_code}") from None

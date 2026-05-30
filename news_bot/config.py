@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     news_check_interval_hours: int = Field(4, validation_alias="NEWS_CHECK_INTERVAL_HOURS")
     min_ai_score: int = Field(8, validation_alias="MIN_AI_SCORE")
 
-    breaking_check_interval_minutes: int = Field(60, validation_alias="BREAKING_CHECK_INTERVAL_MINUTES")
+    breaking_check_interval_minutes: int = Field(180, validation_alias="BREAKING_CHECK_INTERVAL_MINUTES")
     breaking_max_age_hours: int = Field(3, validation_alias="BREAKING_MAX_AGE_HOURS")
     breaking_min_ai_score: int = Field(9, validation_alias="BREAKING_MIN_AI_SCORE")
     max_breaking_posts_per_day: int = Field(2, validation_alias="MAX_BREAKING_POSTS_PER_DAY")
